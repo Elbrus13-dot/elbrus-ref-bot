@@ -1,79 +1,142 @@
+import os
 import sqlite3
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import threading
+from flask import Flask
+from telegram import (
+    Update, ReplyKeyboardMarkup, LabeledPrice
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters,
+    PreCheckoutQueryHandler
+)
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
 
-BOT_TOKEN = "8545939138:AAGMlkFhroyFFhz_LItAhK-iqAfWp-qgBf4"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))  # замени на свой Telegram ID
+DB_PATH = "payments.db"
 
-# --- База данных ---
-conn = sqlite3.connect("database.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, referrer INTEGER, joined TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-conn.commit()
+# Flask сервер для Render
+app = Flask(__name__)
 
-# --- Главное меню ---
-def get_main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Войти в платный чат", callback_data="chat")],
-        [InlineKeyboardButton("📞 Консультация", callback_data="consult")],
-        [InlineKeyboardButton("🤝 Моя реферальная ссылка", callback_data="ref")],
-        [InlineKeyboardButton("📊 Моя статистика", callback_data="stats")]
-    ])
+@app.route("/")
+def home():
+    return "✅ Bot is running!"
 
-# --- Команда /start ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = context.args
+def run_flask():
+    port = int(os.getenv("PORT", 10000))  # Render задаёт PORT автоматически
+    app.run(host="0.0.0.0", port=port)
 
-    # Проверка реферала
-    referrer = None
-    if args and args[0].isdigit():
-        referrer = int(args[0])
-        cursor.execute("INSERT INTO users (id, referrer) VALUES (?, ?)", (user_id, referrer))
-    else:
-        cursor.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
+# Инициализация базы
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS payments (
+        user_id INTEGER,
+        amount INTEGER,
+        timestamp TEXT
+    )""")
     conn.commit()
+    conn.close()
 
-    await update.message.reply_text(
-        "👋 Привет! Добро пожаловать в Elbrus Bot.\nВыбери действие:",
-        reply_markup=get_main_menu()
-    )
+# Приветствие
+async def start(update: Update, context):
+    user = update.effective_user
+    name = user.first_name or "друг"
+    keyboard = [
+        ["💬 Платный чат", "📞 Консультация"],
+        ["🤝 Партнерская программа", "📨 Связаться"],
+        ["👤 Профиль", "💳 Оплатить"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(f"Привет, {name}! Я бот Эльбруса. Выберите действие:", reply_markup=reply_markup)
 
-# --- Обработка кнопок ---
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
+# Обработка кнопок
+async def message_handler(update: Update, context):
+    text = update.message.text
+    if text == "💬 Платный чат":
+        await update.message.reply_text("🔐 Доступ к платному чату: @elbrustyle")
+    elif text == "📞 Консультация":
+        await update.message.reply_text("📲 Запись: @konsalting13_bot")
+    elif text == "🤝 Партнерская программа":
+        await update.message.reply_text("💼 Условия: напиши @elbrustyle")
+    elif text == "📨 Связаться":
+        await update.message.reply_text("📬 Связь: @elbrustyle")
+    elif text == "👤 Профиль":
+        await update.message.reply_text("👤 Ваш профиль: скоро будет доступен.")
+    elif text == "💳 Оплатить":
+        prices = [LabeledPrice("Доступ в VIP чат", 50000)]  # 500 руб
+        await context.bot.send_invoice(
+            chat_id=update.effective_chat.id,
+            title="VIP доступ",
+            description="После оплаты вы получите доступ",
+            payload="chat-access",
+            provider_token=PAYMENT_TOKEN,
+            currency="RUB",
+            prices=prices,
+            start_parameter="access"
+        )
+    else:
+        await update.message.reply_text("Я не понял. Выберите кнопку.")
 
-    if query.data == "chat":
-        await query.edit_message_text("💬 Закрытый чат: доступ после оплаты USDT TRC-20 → TQWaLHTjundsvsoRJjtFsPysUqJaiqeU1H")
-    elif query.data == "consult":
-        await query.edit_message_text("📞 Консультация: пиши @elbrustyle")
-    elif query.data == "ref":
-        ref_link = f"https://t.me/{context.bot.username}?start={user_id}"
-        await query.edit_message_text(f"🤝 Твоя реферальная ссылка:\n{ref_link}")
-    elif query.data == "stats":
-        cursor.execute("SELECT COUNT(*) FROM users WHERE referrer=?", (user_id,))
-        referrals = cursor.fetchone()[0]
-        await query.edit_message_text(f"📊 Статистика:\nТы пригласил {referrals} человек.")
+# Проверка перед оплатой
+async def precheckout_callback(update: Update, context):
+    query = update.pre_checkout_query
+    if query.invoice_payload != "chat-access":
+        await query.answer(ok=False, error_message="Неверный платёж.")
+    else:
+        await query.answer(ok=True)
 
-# --- Автопрогрев ---
-async def auto_message(context: ContextTypes.DEFAULT_TYPE):
-    for user in cursor.execute("SELECT id FROM users").fetchall():
-        try:
-            await context.bot.send_message(user[0], "🔥 Новые связки и кейсы уже доступны! Загляни в чат.")
-        except:
-            pass
+# Успешная оплата
+async def successful_payment(update: Update, context):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO payments VALUES (?, ?, ?)", (
+        user_id, 500, datetime.now().isoformat()
+    ))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("✅ Оплата прошла! Доступ открыт.")
 
-# --- Запуск ---
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(handle_buttons))
+# Автопрогрев
+def send_daily_tip():
+    bot = Application.builder().token(BOT_TOKEN).build().bot
+    chat_id = os.getenv("CHAT_ID")
+    if chat_id:
+        bot.send_message(chat_id=int(chat_id), text="🔥 Совет дня: будь на шаг впереди!")
 
-# Планировщик автопрогрева
-scheduler = AsyncIOScheduler()
-scheduler.add_job(auto_message, "interval", hours=24, args=[app.bot])
-scheduler.start()
+# Админка
+async def admin_panel(update: Update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*), SUM(amount) FROM payments")
+    count, total = c.fetchone()
+    conn.close()
+    await update.message.reply_text(f"💰 Доход: {total or 0}₽\n👥 Оплатили: {count} человек")
 
-print("✅ Бот запущен")
-app.run_polling()
+# Запуск
+def main():
+    init_db()
+    app_tg = Application.builder().token(BOT_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", start))
+    app_tg.add_handler(CommandHandler("admin", admin_panel))
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app_tg.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app_tg.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(send_daily_tip, "interval", hours=24)
+    scheduler.start()
+
+    # Запускаем Flask параллельно
+    threading.Thread(target=run_flask).start()
+
+    # Запускаем Telegram бота
+    app_tg.run_polling()
+
+if __name__ == "__main__":
+    main()
